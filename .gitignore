@@ -1,0 +1,16 @@
+# Secrets and local environment
+.env
+.venv/
+__pycache__/
+.DS_Store
+.claude/
+
+# Per-user data: conversations and uploaded documents
+chats/
+library/
+
+# Loose PDFs in the project folder (answers, source books, plans)
+/*.pdf
+
+# Logs
+output/*_log.txt

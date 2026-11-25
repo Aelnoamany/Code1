@@ -1,0 +1,5 @@
+google-genai
+pymupdf
+streamlit
+python-dotenv
+markdown-it-py
