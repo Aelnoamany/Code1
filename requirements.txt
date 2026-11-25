@@ -1,5 +1,9 @@
-google-genai
-pymupdf
-streamlit
-python-dotenv
-markdown-it-py
+# Versions this app is tested with (Python 3.14)
+google-genai==2.33.0
+httpx==0.28.1
+markdown-it-py==4.2.0
+pillow==13.0.0
+pydantic==2.14.1
+pymupdf==2.0
+python-dotenv==1.2.4
+streamlit==1.66.1
