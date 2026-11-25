@@ -5,9 +5,10 @@ __pycache__/
 .DS_Store
 .claude/
 
-# Per-user data: conversations and uploaded documents
+# Conversations stay private. Uploaded documents (library/) are kept so a cloud copy
+# answers from the same documents; only their processing logs are left out.
 chats/
-library/
+library/*/log.txt
 
 # Loose PDFs in the project folder (answers, source books, plans)
 /*.pdf
