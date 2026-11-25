@@ -20,11 +20,12 @@ import tempfile
 import time
 from pathlib import Path
 
+import httpx
 import pymupdf
 import streamlit as st
 from dotenv import load_dotenv
 from google import genai
-from google.genai import types
+from google.genai import errors, types
 from markdown_it import MarkdownIt
 
 from ocr import PDF_DIR, first_page_number
@@ -160,12 +161,24 @@ def get_client():
 # one. An explicit cache stores the processed book on Google's side for an hour,
 # and each question just points at it: first words in ~2s instead of ~17s.
 # Streamlit recreates it after 50 minutes, before Google's copy expires.
+def with_retries(call, tries: int = 3):
+    """Run a Gemini call again when the connection drops (VPNs and proxies reset long uploads)."""
+    for attempt in range(1, tries + 1):
+        try:
+            return call()
+        except (httpx.HTTPError, errors.ServerError) as e:
+            if attempt == tries:
+                raise
+            print(f"Gemini connection dropped ({e}), trying again", flush=True)
+            time.sleep(2 * attempt)
+
+
 @st.cache_resource(ttl=50 * 60)
 def get_book_cache(_client, _system_instruction: str, corpus_key: tuple):
-    return _client.caches.create(
+    return with_retries(lambda: _client.caches.create(
         model=MODEL,
         config=types.CreateCachedContentConfig(system_instruction=_system_instruction, ttl="3600s"),
-    )
+    ))
 
 
 # ---- Uploaded documents -------------------------------------------------------
@@ -299,7 +312,10 @@ def load_corpus(key: tuple, used: tuple) -> str:
 
 @st.cache_data(show_spinner=False)
 def corpus_tokens(_corpus: str, key: tuple) -> int:
-    return get_client().models.count_tokens(model=MODEL, contents=_corpus).total_tokens
+    try:
+        return with_retries(lambda: get_client().models.count_tokens(model=MODEL, contents=_corpus).total_tokens)
+    except (httpx.HTTPError, errors.APIError):
+        return len(_corpus) // 3  # rough estimate; only used for the size check
 
 
 # ---- Pages, tables and figures behind an answer -----------------------------------
@@ -875,6 +891,22 @@ def upload_form() -> None:
                 st.rerun()
 
 
+def answer_chunks(client, model: str, contents: list, config, tries: int = 3):
+    """Stream the answer. If the connection drops before any text arrives, ask again."""
+    for attempt in range(1, tries + 1):
+        started = False
+        try:
+            for chunk in client.models.generate_content_stream(model=model, contents=contents, config=config):
+                started = started or bool(chunk.text)
+                yield chunk
+            return
+        except (httpx.HTTPError, errors.ServerError) as e:
+            if started or attempt == tries:
+                raise
+            print(f"Gemini connection dropped ({e}), asking again", flush=True)
+            time.sleep(2 * attempt)
+
+
 def signed_in() -> bool:
     """When APP_PASSWORD is set in .env, ask for it once per browser session."""
     password = os.getenv("APP_PASSWORD")
@@ -994,48 +1026,66 @@ def main() -> None:
             )
             for m in messages
         ]
-        cache = get_book_cache(client, f"{INSTRUCTIONS}\n\n{corpus}", (corpus_key, INSTRUCTIONS))
+        try:
+            cache = get_book_cache(client, f"{INSTRUCTIONS}\n\n{corpus}", (corpus_key, INSTRUCTIONS))
+        except (httpx.HTTPError, errors.APIError) as e:
+            print(f"Gemini failed: {e!r}", flush=True)
+            st.error("Could not reach Gemini. Please send the question again.\n\n"
+                     "تعذر الاتصال بـ Gemini. أرسل السؤال مرة أخرى.")
+            messages.pop()
+            return
         config = types.GenerateContentConfig(
             cached_content=cache.name,
             # Low thinking: same answers on this book in tests, ~8x faster to start.
             # Long questions describe a project and need many calculations, which go
             # wrong at low thinking, so those get more time.
+            # Thought summaries are streamed (and not shown) so the connection never sits
+            # silent for minutes while the model thinks; silent connections get dropped.
             thinking_config=types.ThinkingConfig(
-                thinking_level="high" if attached or len(question) > DETAILED_QUESTION_CHARS else "low"
+                thinking_level="high" if attached or len(question) > DETAILED_QUESTION_CHARS else "low",
+                include_thoughts=True,
             ),
         )
 
         with st.chat_message("assistant"):
-            waiting = st.empty()
-            waiting.markdown("▌")
-            chunks = iter(client.models.generate_content_stream(model=cache.model, contents=contents, config=config))
-            # The answer is in the documents' language, not necessarily the question's, so
-            # read its first words before choosing the text direction
-            answer = ""
-            for chunk in chunks:
-                answer += chunk.text or ""
-                if len(re.findall(r"[؀-ۿA-Za-z]", answer)) >= 30:
-                    break
-            waiting.empty()
-            rtl = is_arabic(answer)
-            with message_box(len(messages), rtl):
-                # Stream into a placeholder so [fig:…] tags can be tidied as the text arrives
-                placeholder = st.empty()
-                placeholder.markdown(tidy(answer, rtl) + " ▌")
+            try:
+                waiting = st.empty()
+                waiting.markdown("▌")
+                chunks = iter(answer_chunks(client, cache.model, contents, config))
+                # The answer is in the documents' language, not necessarily the question's, so
+                # read its first words before choosing the text direction
+                answer = ""
                 for chunk in chunks:
-                    if chunk.text:
-                        answer += chunk.text
-                        placeholder.markdown(tidy(answer, rtl) + " ▌")
-                placeholder.markdown(tidy(answer, rtl))
-                if usage := chunk.usage_metadata:  # in the server log: how much came from the cache
-                    print(f"tokens: {usage.prompt_token_count:,} in ({usage.cached_content_token_count or 0:,} "
-                          f"from cache), {usage.candidates_token_count or 0:,} out", flush=True)
-                pages = cited_pages(answer)
-                figures = cited_figures(answer, pages)
-                reply = {"role": "assistant", "content": answer, "pages": pages, "figures": figures, "rtl": rtl}
-                answer_actions(len(messages), question, reply)
-                show_number_check(answer, question, rtl)
-                show_sources(pages, figures, rtl)
+                    answer += chunk.text or ""
+                    if len(re.findall(r"[؀-ۿA-Za-z]", answer)) >= 30:
+                        break
+                waiting.empty()
+                rtl = is_arabic(answer)
+                with message_box(len(messages), rtl):
+                    # Stream into a placeholder so [fig:…] tags can be tidied as the text arrives
+                    placeholder = st.empty()
+                    placeholder.markdown(tidy(answer, rtl) + " ▌")
+                    for chunk in chunks:
+                        if chunk.text:
+                            answer += chunk.text
+                            placeholder.markdown(tidy(answer, rtl) + " ▌")
+                    placeholder.markdown(tidy(answer, rtl))
+                    if usage := chunk.usage_metadata:  # in the server log: how much came from the cache
+                        print(f"tokens: {usage.prompt_token_count:,} in ({usage.cached_content_token_count or 0:,} "
+                              f"from cache), {usage.candidates_token_count or 0:,} out", flush=True)
+                    pages = cited_pages(answer)
+                    figures = cited_figures(answer, pages)
+                    reply = {"role": "assistant", "content": answer, "pages": pages, "figures": figures, "rtl": rtl}
+                    answer_actions(len(messages), question, reply)
+                    show_number_check(answer, question, rtl)
+                    show_sources(pages, figures, rtl)
+            except (httpx.HTTPError, errors.APIError) as e:
+                print(f"Gemini failed: {e!r}", flush=True)
+                st.error("The connection to Gemini dropped before the answer was finished. "
+                         "Please send the question again.\n\n"
+                         "انقطع الاتصال بـ Gemini قبل اكتمال الإجابة. أرسل السؤال مرة أخرى.")
+                messages.pop()  # the question was not answered: leave it out of the chat
+                return
         messages.append(reply)
         save_chat(st.session_state.chat_id, messages)
         if new_chat:
